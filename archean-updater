@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+
+set -u # Error on unset variables
+
+###############################################################################
+# Settings
+###############################################################################
+
+# Should docker be run as root?
+DOCKER_ROOT=1
+# What command should be used to become root if I am running as a non-root user however docker is being ran as root? (default: sudo)
+# Make sure that no password is required for the docker command
+# This is only used if DOCKER_ROOT is set to 1 and the script is not ran as root
+BECOME_COMMAND="sudo"
+
+# Setting LOG_FILE to the following will log to the current user's home directory (useful if you don't want to run this as root)
+#LOG_FILE=${HOME}/archean-updater/archean-updater.log
+# Setting LOG_FILE to the following will log to /var/log/archean-updater.log (useful if you want to run this as root)
+LOG_FILE=/var/log/archean-updater.log
+
+# The permissions to set the log file to (0644 will allow a non-root user to be able to read /var/log/archean-updater.log without needing to use sudo)
+LOG_FILE_MASK=0644
+# When the log file reaches this size, it will be rotated to $LOG_FILE.1 and a new log file will be opened
+MAX_LOG_SIZE=10048576 # 10MB
+
+# How often to check for a new container. Default: 1 hour (3600 seconds) It is recommended to not change this due to the anonymous rate limiting of the Docker Hub API
+CHECK_EVERY=3600
+
+# This should match what is in run-server.sh
+# The Docker container name
+DOCKER_CONTAINER_NAME="archean_server"
+# Local Data Directory that will be bind mounted to the container
+DOCKER_DATA_DIRECTORY="./${DOCKER_CONTAINER_NAME}.data"
+# The port you want to run the server on (both TCP and UDP)
+DOCKER_PORT=8881
+
+# Change this to 1 if you have gone through the settings. This is to prevent the script from running before you have set everything up
+SETUP_COMPLETE=1
+
+###############################################################################
+# END SETTINGS
+###############################################################################
+
+
+# The container name and tag to check for updates (don't change this unless you know what you are doing)
+CONTAINER_NAME=xenon3d/archean-server-alpha
+TAG=latest
+
+DEBUG=0
+FAKE_LOCAL_DIGEST=${DEBUG}
+REQUIRED_PROGRAMS=(curl jq docker)
+
+
+
+# Check if we have STDOUT, if so we are most likely being ran from terminal and thus want color
+COLOR=0
+[[ -t 1 ]] && COLOR=1
+COLOR_RED='\e[31m'
+COLOR_RESET='\e[0m'
+COLOR_CYAN='\e[36m'
+COLOR_YELLOW='\e[33m'
+
+SUDO=""
+
+function log() {
+  if [ ${COLOR} ]; then
+    echo -e "$1"
+  else
+    echo "[$(date -Is)] $1" >> "${LOG_FILE}"
+  fi
+}
+
+function log_info() {
+  if [ ${COLOR} ]; then
+    log "${COLOR_CYAN}INFO: $1${COLOR_RESET}"
+  else
+    log "INFO: $1"
+  fi
+}
+
+function log_warn() {
+  if [ ${COLOR} ]; then
+    log "${COLOR_YELLOW}WARN: $1${COLOR_RESET}"
+  else
+    log "WARN: $1"
+  fi
+}
+
+function log_error() {
+  if [ ${COLOR} ]; then
+    log "${COLOR_RED}ERROR: $1${COLOR_RESET}"
+  else
+    log "ERROR: $1"
+  fi
+}
+
+function error_exit() {
+  echo "ERROR: $1"
+  exit 1
+}
+
+# check_required_programs is a function that will check if the required programs are installed
+function check_required_programs() {
+  # TODO: Add an auto install for the required programs
+  for program in "${REQUIRED_PROGRAMS[@]}"; do
+    if ! command -v "${program}" &>/dev/null; then
+      log_error "Required program '${program}' is not installed"
+      echo "Required program '${program}' is not installed" >&2
+      exit 1
+    fi
+    log_info "Found required program: ${program}"
+  done
+}
+
+function rotate_log() {
+  local log_dir log_file_size
+  log_dir=$(dirname "${LOG_FILE}")
+  [ -d "${log_dir}" ] || mkdir -p "${log_dir}"
+  if [ -f "${LOG_FILE}" ]; then
+    log_file_size=$(stat -c %s "${LOG_FILE}")
+    if [ "${log_file_size}" -gt "${MAX_LOG_SIZE}" ]; then
+      mv "${LOG_FILE}" "${LOG_FILE}.1"
+      touch "$LOG_FILE"
+      chmod "${LOG_FILE_MASK}" "${LOG_FILE}"
+      log "Rotated log file"
+    fi
+  else
+    touch "${LOG_FILE}" || error_exit "Failed to create log file at ${LOG_FILE}"
+    log "Rotated log file"
+  fi
+}
+
+# get_docker_token is a function that will get an anonymous token from the Docker Hub API
+# On success it returns the token, on failure it logs and returns the http status code
+function get_docker_token() {
+  local url response http_code content token
+  url=$1
+  shift
+  response=$(curl -sS --write-out "%{http_code}" "$@" "$url")
+  http_code=${response: -3}
+  content=$(echo "${response}" | head -c-4)
+
+  if [[ $http_code -ge 400 ]]; then
+    # If there is an error code from the the api, log the error
+    # Then return the error code so the caller knows there was an error
+    log_error "Could not get the an anonymous token from the Docker Hub API"
+    log_error " * HTTP Error Code: $http_code"
+    log_error " * $content"
+    echo "$http_code"
+  else
+    token=$(echo "$content" | jq -r '.token')
+    if [ -z "$token" ]; then
+      # Make sure that token was received from the API
+      # If not, log the error and return an the special error code 001
+      log_error "Could not get the an anonymous token from the Docker Hub API"
+      log_error " * HTTP Error Code: $http_code"
+      log_error " * $content"
+      echo "001"
+    fi
+    echo "$token"
+  fi
+}
+
+# get_docker_digest is a function that will get the digest of a container from the Docker Hub API
+# It is special because the Docker Hub API returns a bad digest in the json body
+# But it returns the correct digest in the docker-content-digest header
+# On success it returns the digest, on failure it logs and returns the http status code
+function get_docker_digest() {
+  local url response http_code digest
+  url=$1
+  shift
+  response=$(curl -IsS "$@" "$url")
+  http_code=$(echo "$response"| awk -v FS=" " '/^HTTP/{print $2}')
+  digest=$(echo "$response"| awk -v FS=":" '/^docker-content-digest/{print $3}')
+  if [[ $http_code -ge 400 ]]; then
+    # If there is an error code from the the api, log the error
+    # Then return the error code so the caller knows there was an error
+    log_error "Could not get the digest from the Docker Hub API"
+    log_error " * HTTP Error Code: $http_code"
+    log_error " * $response"
+    echo "$http_code"
+  else
+    # Remove any trailing whitespace from the digest
+    digest=${digest/[$'\r\n']/}
+    if [ -z "$digest" ]; then
+      # Make sure that token was received from the API
+      # If not, log the error and return an the special error code 002
+      log_error "Could not get the digest from the Docker Hub API"
+      log_error " * HTTP Error Code: $http_code"
+      log_error " * $response"
+      echo "002"
+    fi
+    echo "$digest"
+  fi
+}
+
+# get_remote_digest is a function that will get the digest of a container from the Docker Hub API
+# On success it will return the digest, on failure it will log and return an empty string
+function get_remote_digest() {
+  local token digest params
+  params="service=registry.docker.io&scope=repository:${CONTAINER_NAME}:pull"
+
+  token=$(get_docker_token \
+    "https://auth.docker.io/token?${params}"
+  )
+  # If get_docker_token returns a 3 char long string, it is an error code
+  if [ ${#token} -eq 3 ]; then
+    if [ "${token}" -eq 001 ]; then
+      log_error "Could not get the anonymous token from the Docker Hub API will try again next check"
+      echo ""
+      exit
+    else
+      log_error "Received HTTP errorcode: ${token} from the Docker Hub API, will try again next check"
+      echo ""
+      exit
+    fi
+  fi
+
+  digest=$(get_docker_digest \
+    "https://registry-1.docker.io/v2/${CONTAINER_NAME}/manifests/${TAG}" \
+    --header "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+    --header "Authorization: Bearer ${token}"
+  )
+  # If get_docker_digest returns a 3 char long string, it is an error code
+  if [ ${#digest} -eq 3 ]; then
+    if [ "${digest}" -eq 002 ]; then
+      log_error "Could not get digest for ${CONTAINER_NAME}:${TAG} from the Docker Hub API, will try again next check"
+      echo ""
+      exit
+    else
+      log_error "Could not get digest for ${CONTAINER_NAME}:${TAG}, we received HTTP errorcode: ${digest} from the Docker Hub API, will try again next check"
+      echo ""
+      exit
+    fi
+  fi
+  echo "$digest"
+}
+
+# get_local_digest is a function that will get the digest of a container from the local docker daemon
+# On success it will return the digest, on failure it will log and return an empty string
+function get_local_digest() {
+  local LOCAL_DIGEST
+  if [ "${FAKE_LOCAL_DIGEST}" -eq 1 ]; then
+    echo "8ecded2705d6e559a56287b579791f46c40c7b49192eeed284efce3912848342"
+    return
+  fi
+  LOCAL_DIGEST=$(sudo docker image inspect $CONTAINER_NAME:$TAG --format '{{json .RepoDigests}}' | jq -r '.[]' | cut -d ':' -f 2)
+  if [ -z "${LOCAL_DIGEST}" ]; then
+    log_error "Could not get the local digest for ${CONTAINER_NAME}:${TAG} using 'docker image inspect'"
+    return
+  fi
+
+  echo "${LOCAL_DIGEST}"
+}
+
+function start_container() {
+  log_info "Starting container ${DOCKER_CONTAINER_NAME}"
+  if ${SUDO} docker start "${DOCKER_CONTAINER_NAME}" > /dev/null 2>&1; then
+    log_error "Failed to start the container"
+    return 1
+  else
+    log_info "Successfully started the container"
+  fi
+}
+
+function create_container() {
+  log_info "Creating container with the following settings..."
+  log_info " * Name: ${DOCKER_CONTAINER_NAME}"
+  log_info " * Image: ${image}"
+  log_info " * Volumes: ${DOCKER_DATA_DIRECTORY}:/Archean-data/server"
+  log_info " * Port: ${DOCKER_PORT}"
+  if ${SUDO} docker run -it -d -p "${DOCKER_PORT}:8881/tcp" -p "${DOCKER_PORT}:8881/udp" \
+    --name "${DOCKER_CONTAINER_NAME}" \
+    -v "${DOCKER_DATA_DIRECTORY}":/Archean-data/server \
+    "${image}"; then
+    log_error "Failed to create the new container"
+    return 1
+  else
+    log_info "Successfully created the new container"
+  fi
+}
+
+function check_container() {
+  status=$( ${SUDO} docker inspect archean_server --format '{{.State.Status}}' 2> /dev/null )
+  if [[ -n ${status} ]]; then
+    log_info "Container ${DOCKER_CONTAINER_NAME} exists"
+    if [[ "${status}" == "running" ]]; then
+      log_info "Container ${DOCKER_CONTAINER_NAME} is running"
+      return 0
+    else
+      log_info "Container ${DOCKER_CONTAINER_NAME} is not running, attempting to start it"
+      if start_container; then
+        return 254
+      fi
+    fi
+  else
+    log_info "Container ${DOCKER_CONTAINER_NAME} does not exist, attempting to create it"
+    if create_container; then
+      return 255
+    else
+      return 0
+    fi
+  fi
+}
+
+function run_update() {
+  local image
+  image="$CONTAINER_NAME:$TAG"
+  log_info "Pulling ${image}"
+  if ${SUDO} docker pull "${image}"; then
+    log_error "Failed to pull ${image}"
+    return 1
+  else
+    log_info "Successfully pulled ${image}"
+  fi
+
+  log_info "Stopping the old container"
+  if ${SUDO} docker stop "${DOCKER_CONTAINER_NAME}" > /dev/null 2>&1; then
+    log_error "Failed to stop the old container"
+    return 1
+  else
+    log_info "Successfully stopped the old container"
+  fi
+
+  log_info "Removing the old container"
+  if ${SUDO} docker rm "${DOCKER_CONTAINER_NAME}" > /dev/null 2>&1; then
+    log_error "Failed to remove the old container"
+    return 1
+  else
+    log_info "Successfully removed the old container"
+  fi
+
+  if create_container; then
+    return 1
+  fi
+}
+
+# check_for_update is a function that will check if the local and remote digests are the same
+# if they are we log it and then return
+# if they are not we update the container and then return
+function check_for_update() {
+  local local_digest remote_digest
+  local_digest=$(get_local_digest)
+  if [ -z "${local_digest}" ]; then
+    log_error "Could not get the local digest for ${CONTAINER_NAME}:${TAG}"
+    return
+  fi
+  remote_digest=$(get_remote_digest)
+  if [ -z "${remote_digest}" ]; then
+    log_error "Could not get the remote digest for ${CONTAINER_NAME}:${TAG}"
+    return
+  fi
+
+  if [[ "${local_digest}" == "${remote_digest}" ]]; then
+    log_info "There is no update - Digest: ${local_digest}"
+  else
+    log_info "There is an update"
+    log_info " * Local Digest: ${local_digest}"
+    log_info " * Remote Digest: ${remote_digest}"
+    run_update
+  fi
+}
+
+function main() {
+  while true; do
+    check_for_update
+    log_info "Sleeping for ${CHECK_EVERY} seconds"
+    sleep $CHECK_EVERY
+  done
+}
+
+function init() {
+  if [ "${SETUP_COMPLETE}" -eq 0 ]; then
+    log_error "Please go through the settings in the script before running it"
+    echo "Please go through the settings in the script before running it" >&2
+    exit 1
+  fi
+
+  if [ "${DOCKER_ROOT}" -eq 1 ]; then
+    if [ "$EUID" -ne 0 ]; then
+      SUDO=$BECOME_COMMAND
+    fi
+  fi
+  rotate_log
+  log_info "Starting Archean-Server monitor..."
+  check_required_programs
+  if ! check_container; then
+    log_error "The container ${DOCKER_CONTAINER_NAME} could not be started or created"
+    exit 1
+  fi
+}
+
+init
+main
+
+

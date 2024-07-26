@@ -1,0 +1,11 @@
+[Unit]
+Description=Archean Auto Updater
+After=docker.service
+
+[Service]
+ExecStart=/usr/local/archean-updater/archean-updater
+Type=exec
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
